@@ -309,7 +309,8 @@ void LinkGraph::dump(raw_ostream &OS) {
   });
 
   for (auto *Sec : SortedSections) {
-    OS << "section " << Sec->getName() << ":\n\n";
+    OS << "section " << Sec->getName() << ", prot = " << Sec->getMemProt()
+       << ":\n\n";
 
     std::vector<Block *> SortedBlocks;
     llvm::copy(Sec->blocks(), std::back_inserter(SortedBlocks));

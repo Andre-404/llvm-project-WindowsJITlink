@@ -22,11 +22,15 @@
 #include "llvm/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.h"
 #include "llvm/ExecutionEngine/Orc/UnwindInfoRegistrationPlugin.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/ExecutionEngine/Orc/SectCreate.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
+#include "llvm/ADT/SmallVector.h"
 
 #define DEBUG_TYPE "orc"
 
@@ -53,7 +57,7 @@ Function *addHelperAndWrapper(Module &M, StringRef WrapperName,
                               FunctionType *WrapperFnType,
                               GlobalValue::VisibilityTypes WrapperVisibility,
                               StringRef HelperName,
-                              ArrayRef<Value *> HelperPrefixArgs) {
+                              ArrayRef<Value *> HelperPrefixArgs, bool isCOFF) {
   std::vector<Type *> HelperArgTypes;
   for (auto *Arg : HelperPrefixArgs)
     HelperArgTypes.push_back(Arg->getType());
@@ -63,6 +67,8 @@ Function *addHelperAndWrapper(Module &M, StringRef WrapperName,
       FunctionType::get(WrapperFnType->getReturnType(), HelperArgTypes, false);
   auto *HelperFn = Function::Create(HelperFnType, GlobalValue::ExternalLinkage,
                                     HelperName, M);
+  if(isCOFF)
+    HelperFn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
 
   auto *WrapperFn = Function::Create(
       WrapperFnType, GlobalValue::ExternalLinkage, WrapperName, M);
@@ -146,10 +152,22 @@ public:
     StdInterposes[J.mangleAndIntern("__lljit.platform_support_instance")] = {
         ExecutorAddr::fromPtr(this), JITSymbolFlags::Exported};
     StdInterposes[J.mangleAndIntern("__lljit.cxa_atexit_helper")] = {
-        ExecutorAddr::fromPtr(registerCxaAtExitHelper), JITSymbolFlags()};
-
+        ExecutorAddr::fromPtr(registerCxaAtExitHelper), llvm::JITSymbolFlags::Exported};
+    StdInterposes[J.mangleAndIntern("__lljit.run_atexits_helper")] = {
+            ExecutorAddr::fromPtr(runAtExitsHelper), llvm::JITSymbolFlags::Exported};
+    StdInterposes[J.mangleAndIntern("__lljit.atexit_helper")] = {
+            ExecutorAddr::fromPtr(registerAtExitHelper), llvm::JITSymbolFlags::Exported};
     cantFail(PlatformJD.define(absoluteSymbols(std::move(StdInterposes))));
-    cantFail(setupJITDylib(PlatformJD));
+    auto oll = dyn_cast<orc::ObjectLinkingLayer>(&J.getObjLinkingLayer());
+    auto MB = std::make_unique<SmallVectorMemoryBuffer>(SmallVector<char, 8>(8, 0), false);
+    SectCreateMaterializationUnit::ExtraSymbolsMap Syms;
+    Syms[J.getExecutionSession().intern("__dso_handle")] = { JITSymbolFlags::Exported, 0 };
+    if (PlatformJD.getExecutionSession().getTargetTriple().isOSBinFormatCOFF()){
+        Syms[J.getExecutionSession().intern("__ImageBase")] = { JITSymbolFlags::Exported, 0 };
+        // TODO: does PlatformJD need a DLLImport?
+    }
+    cantFail(PlatformJD.define(std::make_unique<SectCreateMaterializationUnit>(
+            *oll, ".text", MemProt::Read, 8, std::move(MB), std::move(Syms))));
     cantFail(J.addIRModule(PlatformJD, createPlatformRuntimeModule()));
   }
 
@@ -157,14 +175,17 @@ public:
 
   /// Adds a module that defines the __dso_handle global.
   Error setupJITDylib(JITDylib &JD) {
-
-    // Add per-jitdylib standard interposes.
-    SymbolMap PerJDInterposes;
-    PerJDInterposes[J.mangleAndIntern("__lljit.run_atexits_helper")] = {
-        ExecutorAddr::fromPtr(runAtExitsHelper), JITSymbolFlags()};
-    PerJDInterposes[J.mangleAndIntern("__lljit.atexit_helper")] = {
-        ExecutorAddr::fromPtr(registerAtExitHelper), JITSymbolFlags()};
-    cantFail(JD.define(absoluteSymbols(std::move(PerJDInterposes))));
+    bool isCOFF = JD.getExecutionSession().getTargetTriple().isOSBinFormatCOFF();
+    auto oll = dyn_cast<orc::ObjectLinkingLayer>(&J.getObjLinkingLayer());
+    auto MB = std::make_unique<SmallVectorMemoryBuffer>(SmallVector<char, 8>(8, 0), false);
+    SectCreateMaterializationUnit::ExtraSymbolsMap Syms;
+    Syms[J.getExecutionSession().intern("__dso_handle")] = { JITSymbolFlags::Exported, 0 };
+    if (isCOFF){
+        JD.addGenerator(orc::DLLImportDefinitionGenerator::Create(J.getExecutionSession(), *oll));
+        Syms[J.getExecutionSession().intern("__ImageBase")] = { JITSymbolFlags::Exported, 0 };
+    }
+    cantFail(JD.define(std::make_unique<SectCreateMaterializationUnit>(
+            *oll, ".text", MemProt::Read, 8, std::move(MB), std::move(Syms))));
 
     auto Ctx = std::make_unique<LLVMContext>();
     auto M = std::make_unique<Module>("__standard_lib", *Ctx);
@@ -173,11 +194,13 @@ public:
     auto *Int64Ty = Type::getInt64Ty(*Ctx);
     auto *DSOHandle = new GlobalVariable(
         *M, Int64Ty, true, GlobalValue::ExternalLinkage,
-        ConstantInt::get(Int64Ty, reinterpret_cast<uintptr_t>(&JD)),
+        nullptr,
         "__dso_handle");
-    DSOHandle->setVisibility(GlobalValue::DefaultVisibility);
-    DSOHandle->setInitializer(
-        ConstantInt::get(Int64Ty, ExecutorAddr::fromPtr(&JD).getValue()));
+    if(isCOFF)
+      auto *ImageBase = new GlobalVariable(
+          *M, Int64Ty, true, GlobalValue::ExternalLinkage,
+          nullptr,
+          "__ImageBase");
 
     auto *GenericIRPlatformSupportTy =
         StructType::create(*Ctx, "lljit.GenericLLJITIRPlatformSupport");
@@ -190,14 +213,14 @@ public:
     addHelperAndWrapper(
         *M, "__lljit_run_atexits", FunctionType::get(VoidTy, {}, false),
         GlobalValue::HiddenVisibility, "__lljit.run_atexits_helper",
-        {PlatformInstanceDecl, DSOHandle});
+        {PlatformInstanceDecl, DSOHandle}, isCOFF);
 
     auto *IntTy = Type::getIntNTy(*Ctx, sizeof(int) * CHAR_BIT);
     auto *AtExitCallbackPtrTy = PointerType::getUnqual(*Ctx);
     auto *AtExit = addHelperAndWrapper(
         *M, "atexit", FunctionType::get(IntTy, {AtExitCallbackPtrTy}, false),
         GlobalValue::HiddenVisibility, "__lljit.atexit_helper",
-        {PlatformInstanceDecl, DSOHandle});
+        {PlatformInstanceDecl, DSOHandle}, isCOFF);
     Attribute::AttrKind AtExitExtAttr =
         TargetLibraryInfo::getExtAttrForI32Return(J.getTargetTriple());
     if (AtExitExtAttr != Attribute::None)
@@ -476,7 +499,7 @@ private:
         FunctionType::get(IntTy, {CxaAtExitCallbackPtrTy, BytePtrTy, BytePtrTy},
                           false),
         GlobalValue::DefaultVisibility, "__lljit.cxa_atexit_helper",
-        {PlatformInstanceDecl});
+        {PlatformInstanceDecl}, J.getExecutionSession().getTargetTriple().isOSBinFormatCOFF());
     Attribute::AttrKind CxaAtExitExtAttr =
         TargetLibraryInfo::getExtAttrForI32Return(J.getTargetTriple());
     if (CxaAtExitExtAttr != Attribute::None)
@@ -815,7 +838,7 @@ Error LLJITBuilderState::prepareForConstruction() {
       UseJITLink = TT.isOSBinFormatELF();
       break;
     case Triple::x86_64:
-      UseJITLink = !TT.isOSBinFormatCOFF();
+      UseJITLink = true;
       break;
     case Triple::ppc64:
       UseJITLink = TT.isPPC64ELFv2ABI();
