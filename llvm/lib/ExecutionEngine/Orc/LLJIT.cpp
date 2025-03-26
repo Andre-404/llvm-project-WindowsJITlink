@@ -168,6 +168,8 @@ public:
     }
     cantFail(PlatformJD.define(std::make_unique<SectCreateMaterializationUnit>(
             *oll, ".text", MemProt::Read, 8, std::move(MB), std::move(Syms))));
+    cantFail(J.getExecutionSession().lookup(
+      makeJITDylibSearchOrder(&PlatformJD, JITDylibLookupFlags::MatchAllSymbols), J.getExecutionSession().intern("__dso_handle")));
     cantFail(J.addIRModule(PlatformJD, createPlatformRuntimeModule()));
   }
 
@@ -186,6 +188,9 @@ public:
     }
     cantFail(JD.define(std::make_unique<SectCreateMaterializationUnit>(
             *oll, ".text", MemProt::Read, 8, std::move(MB), std::move(Syms))));
+
+    cantFail(J.getExecutionSession().lookup(
+      makeJITDylibSearchOrder(&JD, JITDylibLookupFlags::MatchAllSymbols), J.getExecutionSession().intern("__dso_handle")));
 
     auto Ctx = std::make_unique<LLVMContext>();
     auto M = std::make_unique<Module>("__standard_lib", *Ctx);
