@@ -137,7 +137,7 @@ private:
 /// some runtime API, including __cxa_atexit, dlopen, and dlclose.
 class GenericLLVMIRPlatformSupport : public LLJIT::PlatformSupport {
 public:
-  GenericLLVMIRPlatformSupport(LLJIT &J, JITDylib &PlatformJD)
+  GenericLLVMIRPlatformSupport(LLJIT &J, JITDylib &PlatformJD, JITDylib &BootstrapSymbolsJD)
       : J(J), InitFunctionPrefix(J.mangle("__orc_init_func.")),
         DeInitFunctionPrefix(J.mangle("__orc_deinit_func.")) {
 
@@ -146,9 +146,7 @@ public:
 
     setInitTransform(J, GlobalCtorDtorScraper(*this, InitFunctionPrefix,
                                               DeInitFunctionPrefix));
-
     SymbolMap StdInterposes;
-
     StdInterposes[J.mangleAndIntern("__lljit.platform_support_instance")] = {
         ExecutorAddr::fromPtr(this), JITSymbolFlags::Exported};
     StdInterposes[J.mangleAndIntern("__lljit.cxa_atexit_helper")] = {
@@ -157,19 +155,9 @@ public:
             ExecutorAddr::fromPtr(runAtExitsHelper), llvm::JITSymbolFlags::Exported};
     StdInterposes[J.mangleAndIntern("__lljit.atexit_helper")] = {
             ExecutorAddr::fromPtr(registerAtExitHelper), llvm::JITSymbolFlags::Exported};
-    cantFail(PlatformJD.define(absoluteSymbols(std::move(StdInterposes))));
-    auto oll = dyn_cast<orc::ObjectLinkingLayer>(&J.getObjLinkingLayer());
-    auto MB = std::make_unique<SmallVectorMemoryBuffer>(SmallVector<char, 8>(8, 0), false);
-    SectCreateMaterializationUnit::ExtraSymbolsMap Syms;
-    Syms[J.getExecutionSession().intern("__dso_handle")] = { JITSymbolFlags::Exported, 0 };
-    if (PlatformJD.getExecutionSession().getTargetTriple().isOSBinFormatCOFF()){
-        Syms[J.getExecutionSession().intern("__ImageBase")] = { JITSymbolFlags::Exported, 0 };
-        // TODO: does PlatformJD need a DLLImport?
-    }
-    cantFail(PlatformJD.define(std::make_unique<SectCreateMaterializationUnit>(
-            *oll, ".text", MemProt::Read, 8, std::move(MB), std::move(Syms))));
-    cantFail(J.getExecutionSession().lookup(
-      makeJITDylibSearchOrder(&PlatformJD, JITDylibLookupFlags::MatchAllSymbols), J.getExecutionSession().intern("__dso_handle")));
+    cantFail(BootstrapSymbolsJD.define(absoluteSymbols(std::move(StdInterposes))));
+
+    cantFail(setupJITDylib(PlatformJD));
     cantFail(J.addIRModule(PlatformJD, createPlatformRuntimeModule()));
   }
 
@@ -213,6 +201,8 @@ public:
     auto *PlatformInstanceDecl = new GlobalVariable(
         *M, GenericIRPlatformSupportTy, true, GlobalValue::ExternalLinkage,
         nullptr, "__lljit.platform_support_instance");
+    if(isCOFF)
+      PlatformInstanceDecl->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
 
     auto *VoidTy = Type::getVoidTy(*Ctx);
     addHelperAndWrapper(
@@ -230,7 +220,6 @@ public:
         TargetLibraryInfo::getExtAttrForI32Return(J.getTargetTriple());
     if (AtExitExtAttr != Attribute::None)
       AtExit->addRetAttr(AtExitExtAttr);
-
     return J.addIRModule(JD, ThreadSafeModule(std::move(M), std::move(Ctx)));
   }
 
@@ -477,6 +466,7 @@ private:
       dbgs() << "Running atexit functions for JD "
              << (*static_cast<JITDylib **>(DSOHandle))->getName() << "\n";
     });
+    dbgs()<<"Running constructor for platform support on address "<<(void*)Self<<"\n";
     static_cast<GenericLLVMIRPlatformSupport *>(Self)->AtExitMgr.runAtExits(
         DSOHandle);
   }
@@ -1078,8 +1068,14 @@ LLJIT::LLJIT(LLJITBuilderState &S, Error &Err)
     if ((Err = S.PrePlatformSetup(*this)))
       return;
 
-  if (!S.SetUpPlatform)
-    S.SetUpPlatform = setUpGenericLLVMIRPlatform;
+  if (!S.SetUpPlatform){
+      S.SetUpPlatform = setUpGenericLLVMIRPlatform;
+      // Default generic platform needs BootstrapSymbolsJD to hold absolute symbols
+      auto &BootstrapSymbolsJD = ES->createBareJITDylib("<BootstrapSymbols>");
+      DefaultLinks.push_back(
+          {&BootstrapSymbolsJD, JITDylibLookupFlags::MatchExportedSymbolsOnly});
+  }
+    
 
   if (auto PlatformJDOrErr = S.SetUpPlatform(*this)) {
     Platform = PlatformJDOrErr->get();
@@ -1242,8 +1238,15 @@ Expected<JITDylibSP> setUpGenericLLVMIRPlatform(LLJIT &J) {
         "Native platforms require a process symbols JITDylib",
         inconvertibleErrorCode());
 
+  auto BootstrapSymbolsJD = J.getJITDylibByName("<BootstrapSymbols>");
+  if (!BootstrapSymbolsJD)
+    return make_error<StringError>(
+        "Native platforms require a bootstrap symbols JITDylib",
+        inconvertibleErrorCode());
+
   auto &PlatformJD = J.getExecutionSession().createBareJITDylib("<Platform>");
   PlatformJD.addToLinkOrder(*ProcessSymbolsJD);
+  PlatformJD.addToLinkOrder(*BootstrapSymbolsJD);
 
   if (auto *OLL = dyn_cast<ObjectLinkingLayer>(&J.getObjLinkingLayer())) {
 
@@ -1288,7 +1291,7 @@ Expected<JITDylibSP> setUpGenericLLVMIRPlatform(LLJIT &J) {
   }
 
   J.setPlatformSupport(
-      std::make_unique<GenericLLVMIRPlatformSupport>(J, PlatformJD));
+      std::make_unique<GenericLLVMIRPlatformSupport>(J, PlatformJD, *BootstrapSymbolsJD));
 
   return &PlatformJD;
 }
