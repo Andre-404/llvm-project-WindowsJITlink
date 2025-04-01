@@ -484,6 +484,8 @@ private:
     auto *PlatformInstanceDecl = new GlobalVariable(
         *M, GenericIRPlatformSupportTy, true, GlobalValue::ExternalLinkage,
         nullptr, "__lljit.platform_support_instance");
+    if(J.getExecutionSession().getTargetTriple().isOSBinFormatCOFF())
+      PlatformInstanceDecl->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
 
     auto *IntTy = Type::getIntNTy(*Ctx, sizeof(int) * CHAR_BIT);
     auto *BytePtrTy = PointerType::getUnqual(*Ctx);
