@@ -522,7 +522,12 @@ Expected<Symbol *> COFFLinkGraphBuilder::createDefinedSymbol(
           *B, Symbol.getValue(), SymbolName, 0, Linkage::Strong, Scope::Local,
           Symbol.getComplexType() == COFF::IMAGE_SYM_DTYPE_FUNCTION, false);
     }
-    if (Definition->Selection == COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE) {
+    // When using MINGW COMDATs that store unwind info aren't marked as associative
+    // Instead we have to implicitly associate them by name
+    StringRef str(*SymbolName);
+    bool isAssociative = (Definition->Selection == COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE) ||
+      (str.starts_with(".pdata$") || str.starts_with(".xdata$") || str.starts_with(".eh_frame$"));
+    if (isAssociative) {
       auto Target = Definition->getNumber(Symbol.isBigObj());
       auto GSym = &G->addDefinedSymbol(
           *B, Symbol.getValue(), SymbolName, 0, Linkage::Strong, Scope::Local,

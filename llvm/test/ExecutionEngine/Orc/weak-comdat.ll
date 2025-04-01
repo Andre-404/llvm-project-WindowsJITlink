@@ -3,7 +3,7 @@
 
 declare i32 @g()
 
-$f = comdat any
+$f = comdat nodeduplicate
 
 define weak i32 @f() comdat {
 entry:
