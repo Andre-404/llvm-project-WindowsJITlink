@@ -466,7 +466,6 @@ private:
       dbgs() << "Running atexit functions for JD "
              << (*static_cast<JITDylib **>(DSOHandle))->getName() << "\n";
     });
-    dbgs()<<"Running constructor for platform support on address "<<(void*)Self<<"\n";
     static_cast<GenericLLVMIRPlatformSupport *>(Self)->AtExitMgr.runAtExits(
         DSOHandle);
   }
